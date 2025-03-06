@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data.SqlClient;
+using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
@@ -233,17 +234,41 @@ namespace SQLCompressionReport.Services
                 }
                 else
                 {
+                    var currentSizeKB = int.Parse(item["CurrentSizeKB"]);
+                    var requestedSizeKB = int.Parse(item["RequestedSizeKB"]);
+                    var savingsPercentage = currentSizeKB != 0 ? ((currentSizeKB - requestedSizeKB) / (double)currentSizeKB) * 100 : 0;
+
                     var newGroup = new Dictionary<string, object>
                     {
                         { "TableName", item["TableName"] },
                         { "CompressionType", item["CompressionType"] },
-                        { "CurrentSizeKB", int.Parse(item["CurrentSizeKB"]) },
-                        { "RequestedSizeKB", int.Parse(item["RequestedSizeKB"]) },
+                        { "CurrentSizeKB", currentSizeKB },
+                        { "RequestedSizeKB", requestedSizeKB },
+                        { "SavingsPercentage", savingsPercentage },
                         { "Details", new List<Dictionary<string, string>> { item } }
                     };
                     groupedResults.Add(newGroup);
                 }
             }
+
+            // Ordenar os resultados pelo CurrentSizeKB do maior para o menor
+            groupedResults.Sort((x, y) => ((int)y["CurrentSizeKB"]).CompareTo((int)x["CurrentSizeKB"]));
+
+            // Adicionar a linha "Total"
+            var totalCurrentSizeKB = groupedResults.Sum(g => (int)g["CurrentSizeKB"]);
+            var totalRequestedSizeKB = groupedResults.Sum(g => (int)g["RequestedSizeKB"]);
+            var totalSavingsPercentage = totalCurrentSizeKB != 0 ? ((totalCurrentSizeKB - totalRequestedSizeKB) / (double)totalCurrentSizeKB) * 100 : 0;
+
+            var totalRow = new Dictionary<string, object>
+            {
+                { "TableName", "Total" },
+                { "CompressionType", "" },
+                { "CurrentSizeKB", totalCurrentSizeKB },
+                { "RequestedSizeKB", totalRequestedSizeKB },
+                { "SavingsPercentage", totalSavingsPercentage },
+                { "Details", new List<Dictionary<string, string>>() }
+            };
+            groupedResults.Add(totalRow);
 
             return groupedResults;
         }
@@ -279,34 +304,67 @@ namespace SQLCompressionReport.Services
             sb.AppendLine("</head>");
             sb.AppendLine("<body>");
             sb.AppendLine("<h2>Tables Compression Report</h2>");
+            
+            // Tabela principal
             sb.AppendLine("<table>");
-            sb.AppendLine("<tr><th></th><th>Table Name</th><th>Compression Type</th><th>Current Size (KB)</th><th>Requested Size (KB)</th></tr>");
+            sb.AppendLine("<tr><th></th><th>Table Name</th><th>Compression Type</th><th>Current Size (KB)</th><th>Requested Size (KB)</th><th>Savings Percentage</th></tr>");
 
             foreach (var item in data)
             {
-                var detailsId = $"details-{item["TableName"]}";
-                sb.AppendLine($"<tr class='expandable' onclick='toggleDetails(\"{detailsId}\")'>");
-                sb.AppendLine($"<td id='icon-{detailsId}'>+</td>");
-                sb.AppendLine($"<td>{item["TableName"]}</td>");
-                sb.AppendLine($"<td>{item["CompressionType"]}</td>");
-                sb.AppendLine($"<td>{item["CurrentSizeKB"]}</td>");
-                sb.AppendLine($"<td>{item["RequestedSizeKB"]}</td>");
-                sb.AppendLine("</tr>");
-                sb.AppendLine($"<tbody id='{detailsId}' class='details'>");
-
-                foreach (var detail in (List<Dictionary<string, string>>)item["Details"])
+                if (item["TableName"].ToString() != "Total")
                 {
-                    sb.AppendLine("<tr>");
-                    sb.AppendLine($"<td colspan='3'></td>"); // Ajustar a indentação
-                    sb.AppendLine($"<td>{detail["CurrentSizeKB"]}</td>");
-                    sb.AppendLine($"<td>{detail["RequestedSizeKB"]}</td>");
-                    sb.AppendLine("</tr>");
-                }
+                    var detailsId = $"details-{item["TableName"]}";
+                    var hasMultipleDetails = ((List<Dictionary<string, string>>)item["Details"]).Count > 1;
+                    var expandIcon = hasMultipleDetails ? "+" : "";
 
-                sb.AppendLine("</tbody>");
+                    sb.AppendLine($"<tr class='expandable' onclick='toggleDetails(\"{detailsId}\")'>");
+                    sb.AppendLine($"<td id='icon-{detailsId}'>{expandIcon}</td>");
+                    sb.AppendLine($"<td>{item["TableName"]}</td>");
+                    sb.AppendLine($"<td>{item["CompressionType"]}</td>");
+                    sb.AppendLine($"<td>{item["CurrentSizeKB"]}</td>");
+                    sb.AppendLine($"<td>{item["RequestedSizeKB"]}</td>");
+                    sb.AppendLine($"<td>{(item.ContainsKey("SavingsPercentage") ? $"{((double)item["SavingsPercentage"]).ToString("F2")}%": "")}</td>");
+                    sb.AppendLine("</tr>");
+
+                    if (hasMultipleDetails)
+                    {
+                        sb.AppendLine($"<tbody id='{detailsId}' class='details'>");
+
+                        foreach (var detail in (List<Dictionary<string, string>>)item["Details"])
+                        {
+                            sb.AppendLine("<tr>");
+                            sb.AppendLine($"<td colspan='3'></td>"); // Ajustar a indentação
+                            sb.AppendLine($"<td>{detail["CurrentSizeKB"]}</td>");
+                            sb.AppendLine($"<td>{detail["RequestedSizeKB"]}</td>");
+                            sb.AppendLine($"<td></td>"); // Coluna de Savings Percentage vazia para os detalhes
+                            sb.AppendLine("</tr>");
+                        }
+
+                        sb.AppendLine("</tbody>");
+                    }
+                }
             }
 
             sb.AppendLine("</table>");
+
+            // Adicionar espaço antes da tabela de totais
+            sb.AppendLine("<br><br>");
+
+            // Tabela de totais
+            var totalItem = data.First(item => item["TableName"].ToString() == "Total");
+
+            sb.AppendLine("<h2>Total Summary</h2>");
+            sb.AppendLine("<table>");
+            sb.AppendLine("<tr><th>Total Current Size (KB)</th><th>Total Requested Size (KB)</th><th>Total Savings Percentage</th></tr>");
+            
+            sb.AppendLine("<tr>");
+            sb.AppendLine($"<td>{totalItem["CurrentSizeKB"]}</td>");
+            sb.AppendLine($"<td>{totalItem["RequestedSizeKB"]}</td>");
+            sb.AppendLine($"<td>{(totalItem.ContainsKey("SavingsPercentage") ? $"{((double)totalItem["SavingsPercentage"]).ToString("F2")}%": "")}</td>");
+            sb.AppendLine("</tr>");
+
+            sb.AppendLine("</table>");
+
             sb.AppendLine("</body>");
             sb.AppendLine("</html>");
 
