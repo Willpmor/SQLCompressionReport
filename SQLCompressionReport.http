@@ -1,0 +1,6 @@
+@SQLCompressionReport_HostAddress = http://localhost:5105
+
+GET {{SQLCompressionReport_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
