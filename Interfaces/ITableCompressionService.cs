@@ -8,5 +8,8 @@ namespace SQLCompressionReport.Interfaces
     public interface ITableCompressionService
     {
         IActionResult GetTablesCompression(DatabaseConnection connection);
+        IActionResult StartReportCompressionTask(DatabaseConnection connection);
+        IActionResult GetTaskStatus(string taskId);
+
     }
 }

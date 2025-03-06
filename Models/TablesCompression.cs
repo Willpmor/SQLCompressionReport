@@ -16,4 +16,12 @@ namespace SQLCompressionReport.Models
         public string User { get; set; }
         public string Password { get; set; }
     }
+
+    public class TaskStatus
+    {
+        public string TaskId { get; set; }
+        public bool IsCompleted { get; set; }
+        public bool IsSuccessful { get; set; }
+        public string Result { get; set; }
+    }
 }
