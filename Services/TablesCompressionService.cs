@@ -4,6 +4,7 @@ using System.Data.SqlClient;
 using Microsoft.AspNetCore.Mvc;
 using SQLCompressionReport.Interfaces;
 using SQLCompressionReport.Models;
+using System.Text;
 
 namespace SQLCompressionReport.Services
 {
@@ -47,7 +48,48 @@ namespace SQLCompressionReport.Services
                 }
             }
 
-            return new JsonResult(tablesCompression);
+            var htmlContent = GenerateHtmlReport(tablesCompression);
+            var bytes = Encoding.UTF8.GetBytes(htmlContent);
+            var result = new FileContentResult(bytes, "text/html")
+            {
+                FileDownloadName = "tables_compression_report.html"
+            };
+
+            return result;
+        }
+
+        private string GenerateHtmlReport(List<Dictionary<string, string>> data)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("<!DOCTYPE html>");
+            sb.AppendLine("<html>");
+            sb.AppendLine("<head>");
+            sb.AppendLine("<title>Tables Compression Report</title>");
+            sb.AppendLine("<style>");
+            sb.AppendLine("table { width: 100%; border-collapse: collapse; }");
+            sb.AppendLine("table, th, td { border: 1px solid black; }");
+            sb.AppendLine("th, td { padding: 8px; text-align: left; }");
+            sb.AppendLine("th { background-color: #f2f2f2; }");
+            sb.AppendLine("</style>");
+            sb.AppendLine("</head>");
+            sb.AppendLine("<body>");
+            sb.AppendLine("<h2>Tables Compression Report</h2>");
+            sb.AppendLine("<table>");
+            sb.AppendLine("<tr><th>Table Name</th><th>Compression Type</th></tr>");
+
+            foreach (var item in data)
+            {
+                sb.AppendLine("<tr>");
+                sb.AppendLine($"<td>{item["TableName"]}</td>");
+                sb.AppendLine($"<td>{item["CompressionType"]}</td>");
+                sb.AppendLine("</tr>");
+            }
+
+            sb.AppendLine("</table>");
+            sb.AppendLine("</body>");
+            sb.AppendLine("</html>");
+
+            return sb.ToString();
         }
     }
 }

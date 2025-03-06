@@ -17,11 +17,11 @@ namespace SQLCompressionReport.Controllers
         }
 
         [HttpPost]
-        [ProducesResponseType(typeof(JsonResult), 200)]
+        [ProducesResponseType(typeof(FileContentResult), 200)]
         public IActionResult GetTablesCompression([FromBody] DatabaseConnection connection)
         {
-            var tablesCompression = _tableCompressionService.GetTablesCompression(connection);
-            return tablesCompression;
+            var result = _tableCompressionService.GetTablesCompression(connection);
+            return result;
         }
     }
 }
