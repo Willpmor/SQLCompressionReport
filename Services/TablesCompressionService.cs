@@ -26,7 +26,7 @@ namespace SQLCompressionReport.Services
             };
             taskStatuses[taskId] = taskStatus;
 
-            Task.Run(() => ExecuteCompressionTask(connection, taskId));
+            Task.Run(() => ExecuteCompressionTask(connection, taskId, connection.Server, connection.Database));
 
             return new JsonResult(new { TaskId = taskId });
         }
@@ -40,7 +40,7 @@ namespace SQLCompressionReport.Services
             return new NotFoundResult();
         }
 
-        private void ExecuteCompressionTask(DatabaseConnection connection, string taskId)
+        private void ExecuteCompressionTask(DatabaseConnection connection, string taskId, string serverName, string databaseName)
         {
             try
             {
@@ -52,18 +52,35 @@ namespace SQLCompressionReport.Services
                 {
                     conn.Open();
                     string query = @"
-                        SELECT DISTINCT 
-                        C.[name] AS [schema_name],
-                        A.[name] AS [table_name],
-                        B.[data_compression_desc] AS [compression_type]
-                    FROM 
-                        sys.tables                   A
-                        INNER JOIN sys.partitions    B   ON A.[object_id] = B.[object_id]
-                        INNER JOIN sys.schemas       C   ON A.[schema_id] = C.[schema_id]
-                    WHERE 
-                        B.data_compression_desc = 'NONE'
-                        AND B.index_id IN (0, 1) -- HEAP
-                        AND A.[type] = 'U';";
+                        SELECT TOP 300
+                            s.name AS [schema_name],
+                            t.name AS [table_name],   
+                            p.rows,
+                            p.[data_compression_desc] AS [compression_type],
+                            SUM(a.total_pages) * 8 AS TotalSpaceKB, 
+                            CAST(ROUND(((SUM(a.total_pages) * 8) / 1024.00), 2) AS NUMERIC(36, 2)) AS TotalSpaceMB,
+                            SUM(a.used_pages) * 8 AS UsedSpaceKB, 
+                            CAST(ROUND(((SUM(a.used_pages) * 8) / 1024.00), 2) AS NUMERIC(36, 2)) AS UsedSpaceMB, 
+                            (SUM(a.total_pages) - SUM(a.used_pages)) * 8 AS UnusedSpaceKB,
+                            CAST(ROUND(((SUM(a.total_pages) - SUM(a.used_pages)) * 8) / 1024.00, 2) AS NUMERIC(36, 2)) AS UnusedSpaceMB	
+                        FROM 
+                            sys.tables t
+                        INNER JOIN      
+                            sys.indexes i ON t.object_id = i.object_id
+                        INNER JOIN 
+                            sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
+                        INNER JOIN 
+                            sys.allocation_units a ON p.partition_id = a.container_id
+                        LEFT OUTER JOIN 
+                            sys.schemas s ON t.schema_id = s.schema_id
+                        WHERE 
+                            t.name NOT LIKE 'dt%' 
+                            AND t.is_ms_shipped = 0
+                            AND i.object_id > 255 
+                        GROUP BY 
+                            t.name, s.name, p.rows, p.data_compression_desc
+                        ORDER BY
+                            TotalSpaceMB DESC, t.name;";
 
                     using (SqlCommand cmd = new SqlCommand(query, conn))
                     {
@@ -86,33 +103,50 @@ namespace SQLCompressionReport.Services
                     {
                         if (table["CompressionType"] == "NONE")
                         {
-                            string compressionQuery = $@"
-                            EXEC sp_estimate_data_compression_savings '{table["SchemaName"]}', '{table["TableName"]}', NULL, NULL, 'PAGE';";
-
-                            using (SqlCommand compressionCmd = new SqlCommand(compressionQuery, conn))
+                            try
                             {
-                                compressionCmd.CommandTimeout = 0; // Sem limite de tempo para a execução do comando
-                                using (SqlDataReader compressionReader = compressionCmd.ExecuteReader())
+                                string compressionQuery = $@"
+                                EXEC sp_estimate_data_compression_savings '{table["SchemaName"]}', '{table["TableName"]}', NULL, NULL, 'PAGE';";
+
+                                using (SqlCommand compressionCmd = new SqlCommand(compressionQuery, conn))
                                 {
-                                    while (compressionReader.Read())
+                                    compressionCmd.CommandTimeout = 0; // Sem limite de tempo para a execução do comando
+                                    using (SqlDataReader compressionReader = compressionCmd.ExecuteReader())
                                     {
-                                        var compressionResult = new Dictionary<string, string>
+                                        while (compressionReader.Read())
                                         {
-                                            { "TableName", table["TableName"] },
-                                            { "CompressionType", table["CompressionType"] },
-                                            { "CurrentSizeKB", compressionReader["size_with_current_compression_setting(KB)"].ToString() },
-                                            { "RequestedSizeKB", compressionReader["size_with_requested_compression_setting(KB)"].ToString() }
-                                        };
-                                        compressionResults.Add(compressionResult);
+                                            var currentSizeKB = compressionReader["size_with_current_compression_setting(KB)"] != DBNull.Value ? compressionReader["size_with_current_compression_setting(KB)"].ToString() : "0";
+                                            var requestedSizeKB = compressionReader["size_with_requested_compression_setting(KB)"] != DBNull.Value ? compressionReader["size_with_requested_compression_setting(KB)"].ToString() : "0";
+
+                                            var compressionResult = new Dictionary<string, string>
+                                            {
+                                                { "TableName", table["TableName"] },
+                                                { "CompressionType", table["CompressionType"] },
+                                                { "CurrentSizeKB", currentSizeKB },
+                                                { "RequestedSizeKB", requestedSizeKB }
+                                            };
+                                            compressionResults.Add(compressionResult);
+                                        }
                                     }
                                 }
+                            }
+                            catch (Exception)
+                            {
+                                var errorResult = new Dictionary<string, string>
+                                {
+                                    { "TableName", table["TableName"] },
+                                    { "CompressionType", table["CompressionType"] },
+                                    { "CurrentSizeKB", "0" },
+                                    { "RequestedSizeKB", "0" }
+                                };
+                                compressionResults.Add(errorResult);
                             }
                         }
                     }
                 }
 
                 var groupedResults = GroupCompressionResults(compressionResults);
-                var htmlContent = GenerateHtmlReport(groupedResults);
+                var htmlContent = GenerateHtmlReport(groupedResults, serverName, databaseName);
 
                 var reportsDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Reports");
                 if (!Directory.Exists(reportsDirectory))
@@ -204,7 +238,7 @@ namespace SQLCompressionReport.Services
             }
 
             var groupedResults = GroupCompressionResults(compressionResults);
-            var htmlContent = GenerateHtmlReport(groupedResults);
+            var htmlContent = GenerateHtmlReport(groupedResults, connection.Server, connection.Database);
             var bytes = Encoding.UTF8.GetBytes(htmlContent);
             var result = new FileContentResult(bytes, "text/html")
             {
@@ -230,13 +264,15 @@ namespace SQLCompressionReport.Services
                 {
                     existingGroup["CurrentSizeKB"] = (int)existingGroup["CurrentSizeKB"] + int.Parse(item["CurrentSizeKB"]);
                     existingGroup["RequestedSizeKB"] = (int)existingGroup["RequestedSizeKB"] + int.Parse(item["RequestedSizeKB"]);
+                    existingGroup["CurrentSizeGB"] = (double)((int)existingGroup["CurrentSizeKB"]) / (1024.0 * 1024.0);
+                    existingGroup["RequestedSizeGB"] = (double)((int)existingGroup["RequestedSizeKB"]) / (1024.0 * 1024.0);
                     ((List<Dictionary<string, string>>)existingGroup["Details"]).Add(item);
                 }
                 else
                 {
                     var currentSizeKB = int.Parse(item["CurrentSizeKB"]);
                     var requestedSizeKB = int.Parse(item["RequestedSizeKB"]);
-                    var savingsPercentage = currentSizeKB != 0 ? ((currentSizeKB - requestedSizeKB) / (double)currentSizeKB) * 100 : 0;
+                    var savingsPercentage = currentSizeKB != 0 && requestedSizeKB <= currentSizeKB ? ((currentSizeKB - requestedSizeKB) / (double)currentSizeKB) * 100 : 0;
 
                     var newGroup = new Dictionary<string, object>
                     {
@@ -244,6 +280,8 @@ namespace SQLCompressionReport.Services
                         { "CompressionType", item["CompressionType"] },
                         { "CurrentSizeKB", currentSizeKB },
                         { "RequestedSizeKB", requestedSizeKB },
+                        { "CurrentSizeGB", currentSizeKB / (1024.0 * 1024.0) },
+                        { "RequestedSizeGB", requestedSizeKB / (1024.0 * 1024.0) },
                         { "SavingsPercentage", savingsPercentage },
                         { "Details", new List<Dictionary<string, string>> { item } }
                     };
@@ -257,7 +295,7 @@ namespace SQLCompressionReport.Services
             // Adicionar a linha "Total"
             var totalCurrentSizeKB = groupedResults.Sum(g => (int)g["CurrentSizeKB"]);
             var totalRequestedSizeKB = groupedResults.Sum(g => (int)g["RequestedSizeKB"]);
-            var totalSavingsPercentage = totalCurrentSizeKB != 0 ? ((totalCurrentSizeKB - totalRequestedSizeKB) / (double)totalCurrentSizeKB) * 100 : 0;
+            var totalSavingsPercentage = totalCurrentSizeKB != 0 && totalRequestedSizeKB <= totalCurrentSizeKB ? ((totalCurrentSizeKB - totalRequestedSizeKB) / (double)totalCurrentSizeKB) * 100 : 0;
 
             var totalRow = new Dictionary<string, object>
             {
@@ -265,6 +303,8 @@ namespace SQLCompressionReport.Services
                 { "CompressionType", "" },
                 { "CurrentSizeKB", totalCurrentSizeKB },
                 { "RequestedSizeKB", totalRequestedSizeKB },
+                { "CurrentSizeGB", totalCurrentSizeKB / (1024.0 * 1024.0) },
+                { "RequestedSizeGB", totalRequestedSizeKB / (1024.0 * 1024.0) },
                 { "SavingsPercentage", totalSavingsPercentage },
                 { "Details", new List<Dictionary<string, string>>() }
             };
@@ -273,7 +313,7 @@ namespace SQLCompressionReport.Services
             return groupedResults;
         }
 
-        private string GenerateHtmlReport(List<Dictionary<string, object>> data)
+        private string GenerateHtmlReport(List<Dictionary<string, object>> data, string serverName, string databaseName)
         {
             var sb = new StringBuilder();
             sb.AppendLine("<!DOCTYPE html>");
@@ -303,11 +343,11 @@ namespace SQLCompressionReport.Services
             sb.AppendLine("</script>");
             sb.AppendLine("</head>");
             sb.AppendLine("<body>");
-            sb.AppendLine("<h2>Tables Compression Report</h2>");
+            sb.AppendLine($"<h2>Tables Compression Report for Server: {serverName}, Database: {databaseName}</h2>");
             
             // Tabela principal
             sb.AppendLine("<table>");
-            sb.AppendLine("<tr><th></th><th>Table Name</th><th>Compression Type</th><th>Current Size (KB)</th><th>Requested Size (KB)</th><th>Savings Percentage</th></tr>");
+            sb.AppendLine("<tr><th></th><th>Table Name</th><th>Compression Type</th><th>Current Size (GB)</th><th>Requested Size (GB)</th><th>Savings Percentage</th></tr>");
 
             foreach (var item in data)
             {
@@ -321,9 +361,9 @@ namespace SQLCompressionReport.Services
                     sb.AppendLine($"<td id='icon-{detailsId}'>{expandIcon}</td>");
                     sb.AppendLine($"<td>{item["TableName"]}</td>");
                     sb.AppendLine($"<td>{item["CompressionType"]}</td>");
-                    sb.AppendLine($"<td>{item["CurrentSizeKB"]}</td>");
-                    sb.AppendLine($"<td>{item["RequestedSizeKB"]}</td>");
-                    sb.AppendLine($"<td>{(item.ContainsKey("SavingsPercentage") ? $"{((double)item["SavingsPercentage"]).ToString("F2")}%": "")}</td>");
+                    sb.AppendLine($"<td>{Convert.ToDouble(item["CurrentSizeGB"]).ToString("F2")}</td>");
+                    sb.AppendLine($"<td>{Convert.ToDouble(item["RequestedSizeGB"]).ToString("F2")}</td>");
+                    sb.AppendLine($"<td>{(item.ContainsKey("SavingsPercentage") && Convert.ToDouble(item["SavingsPercentage"]) > 0 ? $"{Convert.ToDouble(item["SavingsPercentage"]).ToString("F2")}%": "")}</td>");
                     sb.AppendLine("</tr>");
 
                     if (hasMultipleDetails)
@@ -334,8 +374,8 @@ namespace SQLCompressionReport.Services
                         {
                             sb.AppendLine("<tr>");
                             sb.AppendLine($"<td colspan='3'></td>"); // Ajustar a indentação
-                            sb.AppendLine($"<td>{detail["CurrentSizeKB"]}</td>");
-                            sb.AppendLine($"<td>{detail["RequestedSizeKB"]}</td>");
+                            sb.AppendLine($"<td>{Convert.ToDouble(detail["CurrentSizeKB"]) / (1024.0 * 1024.0):F2}</td>");
+                            sb.AppendLine($"<td>{Convert.ToDouble(detail["RequestedSizeKB"]) / (1024.0 * 1024.0):F2}</td>");
                             sb.AppendLine($"<td></td>"); // Coluna de Savings Percentage vazia para os detalhes
                             sb.AppendLine("</tr>");
                         }
@@ -355,12 +395,12 @@ namespace SQLCompressionReport.Services
 
             sb.AppendLine("<h2>Total Summary</h2>");
             sb.AppendLine("<table>");
-            sb.AppendLine("<tr><th>Total Current Size (KB)</th><th>Total Requested Size (KB)</th><th>Total Savings Percentage</th></tr>");
+            sb.AppendLine("<tr><th>Total Current Size (GB)</th><th>Total Requested Size (GB)</th><th>Total Savings Percentage</th></tr>");
             
             sb.AppendLine("<tr>");
-            sb.AppendLine($"<td>{totalItem["CurrentSizeKB"]}</td>");
-            sb.AppendLine($"<td>{totalItem["RequestedSizeKB"]}</td>");
-            sb.AppendLine($"<td>{(totalItem.ContainsKey("SavingsPercentage") ? $"{((double)totalItem["SavingsPercentage"]).ToString("F2")}%": "")}</td>");
+            sb.AppendLine($"<td>{Convert.ToDouble(totalItem["CurrentSizeGB"]).ToString("F2")}</td>");
+            sb.AppendLine($"<td>{Convert.ToDouble(totalItem["RequestedSizeGB"]).ToString("F2")}</td>");
+            sb.AppendLine($"<td>{(totalItem.ContainsKey("SavingsPercentage") && Convert.ToDouble(totalItem["SavingsPercentage"]) > 0 ? $"{Convert.ToDouble(totalItem["SavingsPercentage"]).ToString("F2")}%": "")}</td>");
             sb.AppendLine("</tr>");
 
             sb.AppendLine("</table>");
